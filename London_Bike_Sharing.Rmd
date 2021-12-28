@@ -1,0 +1,476 @@
+---
+title: "Time Series Analysis of London Bike Sharing"
+author: "Mengfan Ying"
+date: "11/30/2021"
+output: 
+  github_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## 1. Project Goals
+This project aims to utilize historical data of sharing bikes in London and apply **time series analysis** techniques to predict the weekly demand of sharing bikes in the future. 
+
+## 2. Dataset Introduction
+London bike sharing dataset consisted of hourly count of rental bikes between 1/4/2015 and 1/3/2017 in London with the corresponding weather, seasonal, and holiday information. The dataset come from Kaggle <https://www.kaggle.com/hmavrodiev/london-bike-sharing-dataset>, and we added more data that helped us to get more insight about the seasonal variations. The data for the following analysis is in the span of 5 years (1/4/12 to 1/3/17). Considering the granularity of time series, we aggregated hourly data to weekly data.
+
+The important features are:
+
+- "timestamp" - timestamp field aggregated by week 
+- "cnt" - the count of a new bike shares 
+- "t1" - real temperature in C 
+- "t2" - temperature in C "feels like" 
+- "hum" - humidity in percentage 
+- "ws" - wind speed in km/h 
+
+## 3. Load Packages
+```{r packages, message=FALSE}
+library(lubridate)
+library(dplyr)
+library(tidyr)
+library(dataMaid) 
+library(DataExplorer) 
+library(ggplot2)   
+library(lubridate) 
+library(ggfortify) 
+library(zoo)      
+library(forecast)   
+library(TSA)        
+library(fUnitRoots)
+library(lmtest)
+library(tseries)
+library(xts)
+library(astsa)
+library(vars)
+library(MASS)
+library(strucchange)
+library(sandwich)
+library(urca)
+library(dynlm)
+library(astsa)
+library(vars)
+```
+
+## 4. Exploratory Data Analysis
+```{r readfile}
+bike = read.csv('Weekly.csv')
+head(bike)
+```
+
+### 4.1 Five-number summary
+```{r summary}
+summary(bike)
+```
+
+### 4.2 Time Series Plot
+
+Convert to time series object
+```{r convert}
+bikeCount = ts(bike$cnt,start = c(2012,1), frequency =  52)
+biket1 = ts(bike$t1,start = c(2012,1), frequency = 52)
+biket2 = ts(bike$t2,start = c(2012,1), frequency = 52)
+bikehumidity = ts(bike$hum,start = c(2012,1), frequency = 52)
+bikewindspeed = ts(bike$ws,start = c(2012,1), frequency = 52)
+```
+
+```{r vizcnt}
+autoplot(bikeCount)
+```
+
+**Figure 4.2** : Time series plot for variable "count"
+
+## 5. Model Fitting
+### 5.1 ARIMA Model
+#### 5.1.1 Plot ACF, PACF, EACF
+```{r plot5.1.1}
+Acf(bikeCount, lag.max=100)
+Pacf(bikeCount, lag.max=100)
+eacf(bikeCount)
+```
+
+**We observed:**
+
+- a cyclic pattern from ACF plot 
+- strong autocorrelation at lag 1 and weak autocorrelation at some lags before 20 
+- potential non-stationary behavior from EACF 
+
+#### 5.1.2 Apply Differencing
+```{r diff5.1.2}
+Acf(diff(bikeCount), lag.max=100)
+```
+
+**We observed:** 
+Regular (lag 1) differences were computed and despite some spikes at higher order in ACF plot, the values are around zero.
+
+#### 5.1.3 Examine Stationarity
+```{r unitroot5.1.3}
+adfTest(diff(bikeCount), type="nc")
+adfTest(diff(bikeCount), type="c") 
+adfTest(diff(bikeCount), type="ct") 
+kpss.test(diff(bikeCount), null = "Level") 
+kpss.test(diff(bikeCount), null = "Trend") 
+```
+
+**We observed:** 
+Both Dickey-Fuller and KPSS tests indicate differenced data at lag 1 was stationary.
+
+#### 5.1.4 Fit ARIMA Model
+```{r modelfitting5.1.4}
+fitM = Arima(bikeCount, order=c(1, 0, 0), seasonal=list(order=c(1, 1, 0), seasonal=52))
+fitM
+coeftest(fitM)
+
+fitA = auto.arima(bikeCount, seasonal = T)
+fitA
+coeftest(fitA)
+```
+
+**We concluded:** Manually fitted model performs better than automatically generated model. For Manually fitted model, both coefficients are statistically significant. 
+
+#### 5.1.5 Check Model Adequacy
+```{r adequacy5.1.5}
+autoplot(fitM$residuals)
+Acf(fitM$residuals, lag.max=100)
+Box.test(fitM$residuals, lag=10, type="Ljung")
+```
+
+**We observed:** 
+
+- from the autoplot, the residuals of fitM model are not completely white noise because we still saw some autocorrelations 
+- some spikes are coming out at some lags from the ACF plot 
+- However, the Ljung-Box test failed to reject the null hypothesis. In other words, the residuals are white noise!
+
+#### 5.1.6 Validation
+```{r validation5.1.6}
+length(bikeCount)
+train = subset(bikeCount, end=242)
+validate = subset(bikeCount, start=243)
+
+fitV = Arima(train, order=c(1, 0, 0), seasonal=list(order=c(1, 1, 0), seasonal=52))
+
+ptrain = forecast(fitV, h=20)
+plot(ptrain, xlim=c(2012,2017))
+lines(validate, col='red')
+```
+
+**We observed:**
+The model was validated using a 90%/10% split, the blue line is the forecasted data, and the red line is the original data. We could see two lines follow a similar trend despite some gaps.
+
+#### 5.1.7 Forecast
+```{r forecast5.1.7}
+plot(forecast(fitM, xreg=2017:2019))
+title(sub = "Forecast of London Bike Sharing Counts from 2017 to 2020")
+```
+
+**We observed:**
+The forecasts of bike sharing counts for next two years was shown above. We could observe that the cyclic pattern of next two years looks quite similar to the data from 2012 to 2017.
+
+### 5.2 Time Series Regression Model
+#### 5.2.1 Examine Correlation
+*Correlation Analysis*
+``` {r correlation5.2.1}
+cor(bikeCount, biket1)
+s = ts(cbind(bikeCount, biket1), class="mts") 
+autoplot(s, facets = T)    
+```
+
+*Apply lag2.plot and ccf to check lagged regression*
+``` {r lagcheck5.2.1}
+lag2.plot(as.numeric(bikeCount), as.numeric(biket1), 8) 
+ccf(as.numeric(bikeCount), as.numeric(biket1))
+```
+
+#### 5.2.2 Fit OLS Regression Model
+We regard “cnt” as our primary variable. Therefore, we would like to spend a little more time fitting a model for forecasting “cnt.” By plotting the correlation between variables, we found that the other secondary variables have some correlation with the variable “cnt.” Hence, we could regress variable “cnt” on the secondary variables and fit an ARIMA model for the residuals. Since we found the strongest correlation between “cnt” and “t1”, we first fitted an OLS regression model fit0:
+
+$$fit0 = lm(bikeCount ~ biket1)$$
+
+``` {r olsmodel5.2.2}
+fit0 = lm(bikeCount ~ biket1)
+summary(fit0)
+Box.test(fit0$residuals, lag=10, type="Ljung")
+```
+
+**We observed:**
+
+- Coefficients are statistically significant
+- Residuals of model fit0 are not white noise
+
+#### 5.2.3  Examine ACF and PACF of residuals
+``` {r residualcheck5.2.3}
+plot(fit0$residuals, type="l")
+Acf(fit0$residuals, lag.max = 100)
+pacf(fit0$residuals, lag.max = 100)
+eacf (fit0$residuals)
+```
+
+**We observed:** The residuals might contain some non-stationary behaviors.
+
+#### 5.2.4 Apply Differencing
+``` {r diff5.2.4}
+plot(diff(fit0$residuals), type="l")
+Acf(diff(fit0$residuals), lag.max = 100)
+pacf(diff(fit0$residuals), lag.max = 100)
+eacf (diff(fit0$residuals))
+```
+
+**We concluded:**
+
+- We did not observe much autocorrelation in the ACF of difference
+- EACF suggests an ARMA (1, 1) model
+
+#### 5.2.5 Fit Regression Model
+``` {r modelfitting5.2.5}
+fitA = auto.arima(bikeCount, xreg=biket1)
+summary(fitA)
+coeftest(fitA)
+
+fitM = Arima(bikeCount, xreg=biket1, order=c(1, 1, 1), seasonal=list(order=c(1, 0, 0), seasonal=52))
+summary(fitM)
+coeftest(fitM)
+```
+
+**We observed:**
+
+- The auto.arima function suggests an MA (2) model, but the coefficient of the seasonality parameter is about in the edge. 
+- For manually fitted model, an AR (1) MA (1) model works better. All the coefficients are statistically significant.
+
+#### 5.2.6 Check Model Adequacy
+``` {r check adequacy5.2.6}
+autoplot(fitM$residuals) 
+Acf(fitM$residuals, lag.max=100)
+Box.test(fitM$residuals, lag=10, type="Ljung")
+
+autoplot(fitA$residuals) #fitM/fitA
+Acf(fitA$residuals, lag.max=100)
+Box.test(fitA$residuals, lag=10, type="Ljung")
+```
+
+**We concluded:**
+
+- Both models can capture the variance rather well
+- For automatically fitted model(fitA), we still observed some autocorrelation at around lag ten. And the p-value of the Ljung-Box is about in the edge, suggesting that we might or might not reject white noise depending on the confidence level we set
+- Manually fitted model(fitM) has slightly better performance because there is no autocorrelation in residuals and the Ljung-Box suggests that we fail to reject white noise with a high confidence level
+
+#### 5.2.7 Validation
+*We held the last 20 data points and validated the fitM model. *
+``` {r validation5.2.7}
+C_train = subset(bikeCount, end=242)    
+T_train = subset(biket1, end=242)
+C_test = subset(bikeCount, start=243)
+T_test = subset(biket1, start=243)
+
+fitTrain = Arima(C_train, xreg=T_train, order=c(1, 1, 1), seasonal=list(order=c(1, 0, 0), seasonal=52))
+
+plot(forecast(fitTrain, xreg=T_test)) 
+lines(as.numeric(time(C_test)), as.numeric(C_test), col="red")
+```
+
+**We concluded:**
+Compared with the ARIMA model in 5.2.6, we found that the model including regression does a better job capturing details.
+
+#### 5.2.8 Forecast
+*We use the fitM model to forecast the weekly number of bike-sharing for the next two years.*
+``` {r forecaste5.2.8}
+plot(forecast(fitM, xreg=biket1), xlim=c(2012, 2020))
+title(sub = "Forecast of London Bike Sharing Counts from 2017 to 2020")
+```
+
+**We observed:**
+
+- Compared with the ARIMA model in 5.1.7, both models can capture the seasonal trend rather well.
+- The big difference between these two models is the confidence interval. The confidence interval becomes wider when time goes by in the regression model. In contrast, the confidence interval keeps narrow in the ARIMA model.
+
+### 5.3 Vector Autoregression (VAR) Model
+Vector Autoregression Model was applied to explore the multivariate relationships between bike counts and rest of variables. Three relationships were explored as follows: count vs.t1, count vs. humidity, and count vs. windspeed.
+
+Three steps will be done:
+
+- step 1: Use cross correlation function (CCF) to check lagged regressions 
+- step 2: Fit model 
+- step 3: Validation 
+
+#### 5.3.1 count vs.t1
+##### 5.3.1.1 Step 1
+``` {r cntt1}
+ccf(as.numeric(bikeCount), as.numeric(biket1))
+s1 = VARselect(cbind(bikeCount, biket1), lag.max=8, type="const")
+s1
+```
+
+##### 5.3.1.2 Step 2
+``` {r cntt1model}
+fit1 = VAR(cbind(bikeCount, biket1), p=1, type="const")
+fit1
+serial.test(fit1, lags.pt=10, type="PT.asymptotic")
+coeftest(fit1)
+autoplot(forecast(fit1, h=60))
+```
+
+##### 5.3.1.3 Step 3
+``` {r cntt1vali}
+cTrain = subset(bikeCount, end=242)
+cTest = subset(bikeCount, start=243)
+tTrain = subset(biket1, end=242)
+tTest = subset(biket1, start=243)
+
+fitCombined = VAR(cbind(cTrain, tTrain), p=1, type="const")
+f = forecast(fitCombined, h=20, newdata=cbind(cTest, tTest))
+
+fore = f$forecast
+autoplot(fore$cTrain) + 
+  geom_line(aes(x=time(cTest), y=cTest, color="red")) + 
+  ggtitle('Validation plot: count')
+
+autoplot(fore$tTrain) + 
+  geom_line(aes(x=time(tTest), y=tTest, color="red")) + 
+  ggtitle('Validation plot: t1')
+```
+
+#### 5.3.2 count vs. humidity
+##### 5.3.2.1 Step 1
+``` {r cnthum}
+ccf(as.numeric(bikeCount), as.numeric(bikehumidity))
+s2 = VARselect(cbind(bikeCount, bikehumidity), lag.max=8, type="const")
+s2
+```
+
+##### 5.3.2.2 Step 2
+``` {r cnthummodel}
+fit2 = VAR(cbind(bikeCount, bikehumidity), p=2, type="const")
+fit2
+serial.test(fit2, lags.pt=10, type="PT.asymptotic")
+coeftest(fit2)
+autoplot(forecast(fit2, h=60))
+```
+
+##### 5.3.2.3 Step 3
+``` {r cnthumvali}
+cTrain = subset(bikeCount, end=242)
+cTest = subset(bikeCount, start=243)
+tTrain = subset(bikehumidity, end=242)
+tTest = subset(bikehumidity, start=243)
+
+fitCombined = VAR(cbind(cTrain, tTrain), p=2, type="const")
+f = forecast(fitCombined, h=20, newdata=cbind(cTest, tTest))
+
+fore = f$forecast
+autoplot(fore$cTrain) + 
+  geom_line(aes(x=time(cTest), y=cTest, color="red")) +
+  ggtitle('Validation plot: count')
+
+autoplot(fore$tTrain) + 
+  geom_line(aes(x=time(tTest), y=tTest, color="red")) +
+  ggtitle('Validation plot: humidity')
+```
+
+#### 5.3.3 count vs. windspeed
+##### 5.3.3.1 Step 1
+``` {r cntws}
+ccf(as.numeric(bikeCount), as.numeric(bikewindspeed))
+s3 = VARselect(cbind(bikeCount, bikewindspeed), lag.max=8, type="const")
+s3
+```
+
+##### 5.3.3.2 Step 2
+``` {r cntwsmodel}
+fit3 = VAR(cbind(bikeCount, bikewindspeed), p=1, type="const")
+fit3
+serial.test(fit3, lags.pt=10, type="PT.asymptotic")
+coeftest(fit3)
+autoplot(forecast(fit3, h=60))
+```
+
+##### 5.3.3.3 Step 3
+``` {r cntwsvali}
+cTrain = subset(bikeCount, end=242)
+cTest = subset(bikeCount, start=243)
+tTrain = subset(bikewindspeed, end=242)
+tTest = subset(bikewindspeed, start=243)
+
+fitCombined = VAR(cbind(cTrain, tTrain), p=1, type="const")
+f = forecast(fitCombined, h=20, newdata=cbind(cTest, tTest))
+
+fore = f$forecast
+autoplot(fore$cTrain) + 
+  geom_line(aes(x=time(cTest), y=cTest, color="red")) +
+  ggtitle('Validation plot: count')
+
+autoplot(fore$tTrain) + 
+  geom_line(aes(x=time(tTest), y=tTest, color="red")) +
+  ggtitle('Validation plot: windspeed')
+```
+
+**We concluded:**
+
+- Only variable humidity has some lagged correlation with variable count
+- VAR model can only capture the trend but fails to capture the details
+- VAR model does a decent job predicting the very near future data, but the prediction tends to level off to the mean eventually. 
+
+### 5.4 Harmonic Regression Model
+#### 5.4.1 Run a loess fit on the data
+``` {r loess5.4.1}
+loess10 = loess(bikeCount ~ time(bikeCount), data = bikeCount, span = 0.1)
+plot(loess10$fitted, type = 'l')
+smoothed10 = predict(loess10)
+smoothed10_ts = ts(smoothed10, start = 2012, frequency = frequency(bikeCount))
+
+loess30 = loess(bikeCount ~ time(bikeCount), data = bikeCount, span=0.3)
+plot(loess30$fitted, type = 'l')
+smoothed30 = predict(loess30)
+smoothed30_ts = ts(smoothed30, start = 2012, frequency = frequency(bikeCount))
+plot(bikeCount)
+lines(smoothed10_ts, col="red", lwd=2)
+lines(smoothed30_ts, col="blue", lwd=2)
+```
+
+#### 5.4.2 Analyze the Spectral Density of the residual series
+``` {r res5.4.2}
+res10 = ts(loess10$residuals, start = 2012, frequency = frequency(bikeCount))
+head(res10)
+autoplot(res10)
+
+spect = spectrum(res10, log="no", spans=c(2, 2), plot=T, xlab="Frequency (Cycles/Year)")
+```
+
+**We observed:** Three relatively strong frequency
+
+#### 5.4.3 Fit Harmonic Model
+``` {r fitmodel5.4.3}
+fitH = auto.arima(bikeCount, xreg = fourier(bikeCount, K=3), seasonal = FALSE)
+summary(fitH)
+coeftest(fitH)
+```
+
+#### 5.4.4 Check Model Adequacy
+``` {r adequacy5.4.4}
+autoplot(fitH$residuals)
+Acf(fitH$residuals, lag.max = 50)
+Box.test(fitH$residuals, lag = 50, type = 'Ljung-Box')
+```
+
+**We concluded:** the residuals of the harmonic model(fitH) is white noise
+
+#### 5.4.5 Forecast
+``` {r forecast5.4.5}
+autoplot(forecast(fitH, xreg = fourier(bikeCount, K=3, h=100)))
+```
+
+**We concluded:**
+
+- The harmonic model can predict the data by capturing the seasonal pattern well
+- Like VAR model, it fails to capture the details
+- The confidence interval of harmonic model is wider than previous models. In other words, this model is more conservative. 
+
+## 6. Conclusion
+We fitted four models to predict the next two years' bike sharing demand in London:
+
+- The ARIMA Model (5.1.7)
+- The Time Series Regression Model (5.2.8)
+- The Vector Autoregression (VAR) Model (5.3.1.2, 5.3.2.2, 5.3.3.2)
+- The Harmonic Regression Model (5.4.5)
+
+The best model is Time Series Regression Model.
